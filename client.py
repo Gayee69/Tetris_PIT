@@ -16,7 +16,7 @@ WIDTH, HEIGHT = 1280, 720
 FPS = 60
 WHITE = (255, 255, 255)
 CYAN = (0, 255, 255)
-DARK_BG = (10, 10, 30)
+DARK_BG = (0, 0, 0)
 FONT_PATH = pygame.font.match_font('couriernew', bold=True)
 
 # Network settings
@@ -745,6 +745,8 @@ class MultiplayerGame:
         self.paused = False
         self.show_help = False
         self.game_over = False
+        self.p1_game_over = False  # Track individual player game over states
+        self.p2_game_over = False
         
         # Initialize game boards and pieces
         self.p1_board = [[0 for _ in range(10)] for _ in range(20)]
@@ -753,12 +755,20 @@ class MultiplayerGame:
         # Initialize piece states
         self.p1_current_piece = None
         self.p2_current_piece = None
-        self.p1_next_piece = None
-        self.p2_next_piece = None
+        self.p1_next_pieces = []  # Changed to list for three pieces
+        self.p2_next_pieces = []  # Changed to list for three pieces
         self.p1_hold_piece = None
         self.p2_hold_piece = None
         self.p1_piece_pos = [0, 0]
         self.p2_piece_pos = [0, 0]
+        
+        # Add hold flags
+        self.p1_has_held = False
+        self.p2_has_held = False
+        
+        # Store current piece shapes separately from the template
+        self.p1_current_shape = None
+        self.p2_current_shape = None
         
         # Game timing
         self.last_fall_time = time.time()
@@ -768,7 +778,7 @@ class MultiplayerGame:
         self.p1_combo = 0
         self.p2_combo = 0
         
-        # Tetromino shapes
+        # Tetromino shapes (templates)
         self.SHAPES = {
             'I': [[1, 1, 1, 1]],
             'O': [[1, 1], [1, 1]],
@@ -777,6 +787,17 @@ class MultiplayerGame:
             'Z': [[1, 1, 0], [0, 1, 1]],
             'J': [[1, 0, 0], [1, 1, 1]],
             'L': [[0, 0, 1], [1, 1, 1]]
+        }
+
+        # Vibrant colors for each tetromino
+        self.COLORS = {
+            'I': (0, 255, 255),    # Cyan
+            'O': (255, 255, 0),    # Yellow
+            'T': (128, 0, 128),    # Purple
+            'S': (0, 255, 0),      # Green
+            'Z': (255, 0, 0),      # Red
+            'J': (0, 0, 255),      # Blue
+            'L': (255, 165, 0)     # Orange
         }
         
         # Start with new pieces for both players
@@ -821,17 +842,41 @@ class MultiplayerGame:
         """Generate a new piece for the specified player"""
         shapes = list(self.SHAPES.keys())
         if player == 'p1':
-            if not self.p1_next_piece:
-                self.p1_next_piece = random.choice(shapes)
-            self.p1_current_piece = self.p1_next_piece
-            self.p1_next_piece = random.choice(shapes)
+            if not self.p1_next_pieces:  # Initialize next pieces if empty
+                self.p1_next_pieces = [random.choice(shapes) for _ in range(3)]
+            self.p1_current_piece = self.p1_next_pieces.pop(0)  # Get first piece
+            self.p1_current_shape = [row[:] for row in self.SHAPES[self.p1_current_piece]]  # Create a copy
+            self.p1_next_pieces.append(random.choice(shapes))  # Add new piece to end
             self.p1_piece_pos = [3, 0]  # Start position
+            self.p1_has_held = False  # Reset hold flag for new piece
+            
+            # Check if the new piece can be placed
+            if not self.is_valid_move(self.p1_current_shape, self.p1_board, self.p1_piece_pos):
+                self.p1_game_over = True
+                # Send game over status to server
+                self.network.send({
+                    'command': 'game_over',
+                    'player': 'p1',
+                    'score': self.score_p1
+                })
         else:
-            if not self.p2_next_piece:
-                self.p2_next_piece = random.choice(shapes)
-            self.p2_current_piece = self.p2_next_piece
-            self.p2_next_piece = random.choice(shapes)
+            if not self.p2_next_pieces:  # Initialize next pieces if empty
+                self.p2_next_pieces = [random.choice(shapes) for _ in range(3)]
+            self.p2_current_piece = self.p2_next_pieces.pop(0)  # Get first piece
+            self.p2_current_shape = [row[:] for row in self.SHAPES[self.p2_current_piece]]  # Create a copy
+            self.p2_next_pieces.append(random.choice(shapes))  # Add new piece to end
             self.p2_piece_pos = [3, 0]  # Start position
+            self.p2_has_held = False  # Reset hold flag for new piece
+            
+            # Check if the new piece can be placed
+            if not self.is_valid_move(self.p2_current_shape, self.p2_board, self.p2_piece_pos):
+                self.p2_game_over = True
+                # Send game over status to server
+                self.network.send({
+                    'command': 'game_over',
+                    'player': 'p2',
+                    'score': self.score_p2
+                })
 
     def is_valid_move(self, shape, board, pos):
         """Check if a move is valid"""
@@ -846,7 +891,7 @@ class MultiplayerGame:
                         return False
         return True
 
-    def merge_piece(self, shape, board, pos):
+    def merge_piece(self, shape, board, pos, piece_type):
         """Merge the current piece into the board"""
         for y, row in enumerate(shape):
             for x, cell in enumerate(row):
@@ -854,7 +899,7 @@ class MultiplayerGame:
                     board_y = pos[1] + y
                     board_x = pos[0] + x
                     if 0 <= board_y < 20 and 0 <= board_x < 10:
-                        board[board_y][board_x] = 1
+                        board[board_y][board_x] = piece_type  # Store piece type instead of just 1
 
     def clear_lines(self, board):
         """Clear completed lines and return number of lines cleared"""
@@ -874,23 +919,31 @@ class MultiplayerGame:
     def hold_piece(self, player):
         """Handle holding a piece"""
         if player == 'p1':
-            if not self.p1_hold_piece:
-                self.p1_hold_piece = self.p1_current_piece
-                self.p1_current_piece = self.p1_next_piece
-                self.p1_next_piece = random.choice(list(self.SHAPES.keys()))
-                self.p1_piece_pos = [3, 0]
-            else:
-                self.p1_hold_piece, self.p1_current_piece = self.p1_current_piece, self.p1_hold_piece
-                self.p1_piece_pos = [3, 0]
+            if not self.p1_has_held:  # Only allow hold if hasn't held this turn
+                if not self.p1_hold_piece:
+                    self.p1_hold_piece = self.p1_current_piece
+                    self.p1_current_piece = self.p1_next_pieces.pop(0)  # Get first piece
+                    self.p1_current_shape = [row[:] for row in self.SHAPES[self.p1_current_piece]]  # Update current shape
+                    self.p1_next_pieces.append(random.choice(list(self.SHAPES.keys())))  # Add new piece to end
+                    self.p1_piece_pos = [3, 0]
+                else:
+                    self.p1_hold_piece, self.p1_current_piece = self.p1_current_piece, self.p1_hold_piece
+                    self.p1_current_shape = [row[:] for row in self.SHAPES[self.p1_current_piece]]  # Update current shape
+                    self.p1_piece_pos = [3, 0]
+                self.p1_has_held = True  # Mark that piece has been held this turn
         else:
-            if not self.p2_hold_piece:
-                self.p2_hold_piece = self.p2_current_piece
-                self.p2_current_piece = self.p2_next_piece
-                self.p2_next_piece = random.choice(list(self.SHAPES.keys()))
-                self.p2_piece_pos = [3, 0]
-            else:
-                self.p2_hold_piece, self.p2_current_piece = self.p2_current_piece, self.p2_hold_piece
-                self.p2_piece_pos = [3, 0]
+            if not self.p2_has_held:  # Only allow hold if hasn't held this turn
+                if not self.p2_hold_piece:
+                    self.p2_hold_piece = self.p2_current_piece
+                    self.p2_current_piece = self.p2_next_pieces.pop(0)  # Get first piece
+                    self.p2_current_shape = [row[:] for row in self.SHAPES[self.p2_current_piece]]  # Update current shape
+                    self.p2_next_pieces.append(random.choice(list(self.SHAPES.keys())))  # Add new piece to end
+                    self.p2_piece_pos = [3, 0]
+                else:
+                    self.p2_hold_piece, self.p2_current_piece = self.p2_current_piece, self.p2_hold_piece
+                    self.p2_current_shape = [row[:] for row in self.SHAPES[self.p2_current_piece]]  # Update current shape
+                    self.p2_piece_pos = [3, 0]
+                self.p2_has_held = True  # Mark that piece has been held this turn
 
     def draw_text(self, text, pos, font, color=WHITE, center=False):
         render = font.render(text, True, color)
@@ -906,6 +959,40 @@ class MultiplayerGame:
         glow_surface = pygame.Surface((rect.width+20, rect.height+20), pygame.SRCALPHA)
         pygame.draw.rect(glow_surface, (*color, 80), glow_surface.get_rect(), border_radius=10)
         self.screen.blit(glow_surface, (rect.x - 10, rect.y - 10))
+
+    def get_shadow_position(self, shape, board, pos):
+        """Calculate where a piece will land"""
+        shadow_pos = list(pos)  # Create a copy of the current position
+        while self.is_valid_move(shape, board, [shadow_pos[0], shadow_pos[1] + 1]):
+            shadow_pos[1] += 1
+        return shadow_pos
+
+    def draw_piece_cell(self, rect, color):
+        """Draw a single cell of a tetromino with texture effect"""
+        # Main cell
+        pygame.draw.rect(self.screen, color, rect)
+        
+        # Calculate highlight and shadow colors
+        highlight = tuple(min(c + 40, 255) for c in color)
+        shadow = tuple(max(c - 40, 0) for c in color)
+        
+        # Draw highlight (top and left edges)
+        highlight_width = max(2, rect.width // 6)
+        # Top highlight
+        pygame.draw.rect(self.screen, highlight, 
+                        pygame.Rect(rect.left, rect.top, rect.width, highlight_width))
+        # Left highlight
+        pygame.draw.rect(self.screen, highlight, 
+                        pygame.Rect(rect.left, rect.top, highlight_width, rect.height))
+        
+        # Draw shadow (bottom and right edges)
+        shadow_width = max(2, rect.width // 6)
+        # Bottom shadow
+        pygame.draw.rect(self.screen, shadow, 
+                        pygame.Rect(rect.left, rect.bottom - shadow_width, rect.width, shadow_width))
+        # Right shadow
+        pygame.draw.rect(self.screen, shadow, 
+                        pygame.Rect(rect.right - shadow_width, rect.top, shadow_width, rect.height))
 
     def draw_playfield(self):
         # Get player names - Player 1 is always first in lobby_players
@@ -929,9 +1016,9 @@ class MultiplayerGame:
         p2_combo_box = pygame.Rect(p2_score_box.x, p2_score_box.bottom + 50, *combo_box_size)
 
         # Draw Playfields
-        for rect, board, current_piece, piece_pos in [
-            (self.p1_playfield, self.p1_board, self.p1_current_piece, self.p1_piece_pos),
-            (self.p2_playfield, self.p2_board, self.p2_current_piece, self.p2_piece_pos)
+        for rect, board, current_piece, current_shape, piece_pos in [
+            (self.p1_playfield, self.p1_board, self.p1_current_piece, self.p1_current_shape, self.p1_piece_pos),
+            (self.p2_playfield, self.p2_board, self.p2_current_piece, self.p2_current_shape, self.p2_piece_pos)
         ]:
             # Draw grid
             cell_size = rect.width // 10
@@ -944,14 +1031,33 @@ class MultiplayerGame:
                         cell_size - 1
                     )
                     if board[y][x]:
-                        pygame.draw.rect(self.screen, CYAN, cell_rect)
+                        # Get the color for the piece type stored in the board
+                        piece_type = board[y][x]
+                        color = self.COLORS.get(piece_type, CYAN)
+                        self.draw_piece_cell(cell_rect, color)
                     else:
-                        pygame.draw.rect(self.screen, (30, 30, 30), cell_rect)
+                        pygame.draw.rect(self.screen, (0, 0, 0), cell_rect)
+            
+            # Draw shadow
+            if current_piece and current_shape:
+                shadow_pos = self.get_shadow_position(current_shape, board, piece_pos)
+                for y, row in enumerate(current_shape):
+                    for x, cell in enumerate(row):
+                        if cell:
+                            shadow_rect = pygame.Rect(
+                                rect.x + (shadow_pos[0] + x) * cell_size,
+                                rect.y + (shadow_pos[1] + y) * cell_size,
+                                cell_size - 1,
+                                cell_size - 1
+                            )
+                            # Draw semi-transparent shadow with a consistent color
+                            shadow_surface = pygame.Surface((cell_size - 1, cell_size - 1), pygame.SRCALPHA)
+                            shadow_surface.fill((255, 255, 255, 40))  # White shadow with 15% opacity
+                            self.screen.blit(shadow_surface, shadow_rect)
             
             # Draw current piece
-            if current_piece:
-                shape = self.SHAPES[current_piece]
-                for y, row in enumerate(shape):
+            if current_piece and current_shape:
+                for y, row in enumerate(current_shape):
                     for x, cell in enumerate(row):
                         if cell:
                             cell_rect = pygame.Rect(
@@ -960,11 +1066,9 @@ class MultiplayerGame:
                                 cell_size - 1,
                                 cell_size - 1
                             )
-                            pygame.draw.rect(self.screen, CYAN, cell_rect)
+                            color = self.COLORS.get(current_piece, CYAN)
+                            self.draw_piece_cell(cell_rect, color)
             
-            overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
-            overlay.fill((0, 0, 0, 120))
-            self.screen.blit(overlay, rect)
             self.draw_glow_rect(rect, CYAN)
 
         # Draw Hold Boxes
@@ -977,15 +1081,19 @@ class MultiplayerGame:
             if hold_piece:
                 self.draw_piece(hold_piece, rect, 0.8)
 
-        # Draw Next Boxes
-        for rect, next_piece in [(self.p1_next, self.p1_next_piece), (self.p2_next, self.p2_next_piece)]:
+        # Draw Next Boxes with three pieces
+        for rect, next_pieces in [(self.p1_next, self.p1_next_pieces), (self.p2_next, self.p2_next_pieces)]:
             overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 120))
             self.screen.blit(overlay, rect)
             self.draw_glow_rect(rect, CYAN)
             self.draw_text("Next", (rect.x, rect.y - 25), get_font(24))
-            if next_piece:
-                self.draw_piece(next_piece, rect, 0.8)
+            
+            # Draw each next piece in its own section
+            piece_height = rect.height // 3
+            for i, piece in enumerate(next_pieces):
+                piece_rect = pygame.Rect(rect.x, rect.y + i * piece_height, rect.width, piece_height)
+                self.draw_piece(piece, piece_rect, 0.6)  # Slightly smaller scale for next pieces
 
         # Draw Score and Combo Boxes
         for box, label, value in [
@@ -1048,17 +1156,74 @@ class MultiplayerGame:
         p1_name = self.lobby_players[0]
         p2_name = self.lobby_players[1]
 
-        winner = f"{p1_name} Wins!" if self.score_p1 > self.score_p2 else f"{p2_name} Wins!" if self.score_p2 > self.score_p1 else "It's a Tie!"
-        self.draw_text("Game Over", (WIDTH // 2, 80), get_font(36), center=True)
-        self.draw_text(winner, (WIDTH // 2, 130), get_font(36), center=True)
+        # Draw game over text with glow effect
+        game_over_font = get_font(48)
+        status_font = get_font(36)
+        
+        # Game Over text with glow
+        game_over_text = game_over_font.render("Game Over", True, (255, 255, 255))
+        game_over_rect = game_over_text.get_rect(center=(WIDTH // 2, 150))
+        
+        # Create glow effect
+        glow_surface = pygame.Surface((game_over_rect.width + 20, game_over_rect.height + 20), pygame.SRCALPHA)
+        for i in range(10):
+            alpha = 100 - i * 10
+            glow_surface.fill((255, 255, 255, alpha))
+            self.screen.blit(glow_surface, (game_over_rect.centerx - glow_surface.get_width()//2 - 5 + i,
+                                          game_over_rect.centery - glow_surface.get_height()//2 - 5 + i))
+        
+        self.screen.blit(game_over_text, game_over_rect)
 
-        pygame.draw.rect(self.screen, (30, 30, 30), self.btn_main_menu)
-        pygame.draw.rect(self.screen, CYAN, self.btn_main_menu, 2)
-        self.draw_text("Return to Main Menu", self.btn_main_menu.center, get_font(24), center=True)
+        # Show appropriate message based on game state
+        if self.player_role == 'player1':
+            if self.p1_game_over and not self.p2_game_over:
+                status_text = f"Waiting for {p2_name} to finish..."
+            elif self.p1_game_over and self.p2_game_over:
+                if self.score_p1 > self.score_p2:
+                    status_text = f"You Win! {self.score_p1} - {self.score_p2}"
+                elif self.score_p2 > self.score_p1:
+                    status_text = f"You Lose! {self.score_p1} - {self.score_p2}"
+                else:
+                    status_text = f"It's a Tie! {self.score_p1} - {self.score_p2}"
+        else:  # player2
+            if self.p2_game_over and not self.p1_game_over:
+                status_text = f"Waiting for {p1_name} to finish..."
+            elif self.p2_game_over and self.p1_game_over:
+                if self.score_p2 > self.score_p1:
+                    status_text = f"You Win! {self.score_p2} - {self.score_p1}"
+                elif self.score_p1 > self.score_p2:
+                    status_text = f"You Lose! {self.score_p2} - {self.score_p1}"
+                else:
+                    status_text = f"It's a Tie! {self.score_p2} - {self.score_p1}"
 
-        pygame.draw.rect(self.screen, (30, 30, 30), self.btn_exit_game)
-        pygame.draw.rect(self.screen, CYAN, self.btn_exit_game, 2)
-        self.draw_text("Exit Game", self.btn_exit_game.center, get_font(24), center=True)
+        status_surface = status_font.render(status_text, True, (255, 255, 255))
+        status_rect = status_surface.get_rect(center=(WIDTH // 2, 220))
+        self.screen.blit(status_surface, status_rect)
+
+        # Only show buttons when both players are done
+        if (self.player_role == 'player1' and self.p1_game_over and self.p2_game_over) or \
+           (self.player_role == 'player2' and self.p2_game_over and self.p1_game_over):
+            # Draw buttons with hover effect
+            button_font = get_font(28)
+            mouse_pos = pygame.mouse.get_pos()
+
+            # Main Menu button
+            self.btn_main_menu = pygame.Rect(WIDTH // 2 - 120, HEIGHT - 120, 240, 50)
+            main_menu_hover = self.btn_main_menu.collidepoint(mouse_pos)
+            pygame.draw.rect(self.screen, (40, 40, 40) if main_menu_hover else (30, 30, 30), self.btn_main_menu)
+            pygame.draw.rect(self.screen, (0, 255, 255), self.btn_main_menu, 2)
+            main_menu_text = button_font.render("Return to Main Menu", True, (255, 255, 255))
+            main_menu_rect = main_menu_text.get_rect(center=self.btn_main_menu.center)
+            self.screen.blit(main_menu_text, main_menu_rect)
+
+            # Exit Game button
+            self.btn_exit_game = pygame.Rect(WIDTH // 2 - 120, HEIGHT - 60, 240, 50)
+            exit_hover = self.btn_exit_game.collidepoint(mouse_pos)
+            pygame.draw.rect(self.screen, (40, 40, 40) if exit_hover else (30, 30, 30), self.btn_exit_game)
+            pygame.draw.rect(self.screen, (0, 255, 255), self.btn_exit_game, 2)
+            exit_text = button_font.render("Exit Game", True, (255, 255, 255))
+            exit_rect = exit_text.get_rect(center=self.btn_exit_game.center)
+            self.screen.blit(exit_text, exit_rect)
 
     def receive_game_updates(self):
         while True:
@@ -1089,17 +1254,29 @@ class MultiplayerGame:
                                 self.score_p2 = message.get('score', self.score_p2)
                                 self.p2_combo = message.get('combo', self.p2_combo)
                                 self.p2_current_piece = message.get('current_piece', self.p2_current_piece)
-                                self.p2_next_piece = message.get('next_piece', self.p2_next_piece)
+                                self.p2_next_pieces = message.get('next_pieces', self.p2_next_pieces)
                                 self.p2_hold_piece = message.get('hold_piece', self.p2_hold_piece)
                                 self.p2_piece_pos = message.get('piece_pos', self.p2_piece_pos)
+                                # Update the current shape when piece changes
+                                if self.p2_current_piece:
+                                    self.p2_current_shape = [row[:] for row in self.SHAPES[self.p2_current_piece]]
                             else:
                                 self.p1_board = message.get('board', self.p1_board)
                                 self.score_p1 = message.get('score', self.score_p1)
                                 self.p1_combo = message.get('combo', self.p1_combo)
                                 self.p1_current_piece = message.get('current_piece', self.p1_current_piece)
-                                self.p1_next_piece = message.get('next_piece', self.p1_next_piece)
+                                self.p1_next_pieces = message.get('next_pieces', self.p1_next_pieces)
                                 self.p1_hold_piece = message.get('hold_piece', self.p1_hold_piece)
                                 self.p1_piece_pos = message.get('piece_pos', self.p1_piece_pos)
+                                # Update the current shape when piece changes
+                                if self.p1_current_piece:
+                                    self.p1_current_shape = [row[:] for row in self.SHAPES[self.p1_current_piece]]
+                    elif message.get('type') == 'game_over':
+                        # Update game over status for the other player
+                        if message.get('player') == 'p1':
+                            self.p1_game_over = True
+                        elif message.get('player') == 'p2':
+                            self.p2_game_over = True
             except:
                 break
 
@@ -1112,7 +1289,7 @@ class MultiplayerGame:
                 'score': self.score_p1,
                 'combo': self.p1_combo,
                 'current_piece': self.p1_current_piece,
-                'next_piece': self.p1_next_piece,
+                'next_pieces': self.p1_next_pieces,
                 'hold_piece': self.p1_hold_piece,
                 'piece_pos': self.p1_piece_pos
             }
@@ -1123,7 +1300,7 @@ class MultiplayerGame:
                 'score': self.score_p2,
                 'combo': self.p2_combo,
                 'current_piece': self.p2_current_piece,
-                'next_piece': self.p2_next_piece,
+                'next_pieces': self.p2_next_pieces,
                 'hold_piece': self.p2_hold_piece,
                 'piece_pos': self.p2_piece_pos
             }
@@ -1154,7 +1331,27 @@ class MultiplayerGame:
                         cell_size - 1,
                         cell_size - 1
                     )
-                    pygame.draw.rect(self.screen, CYAN, cell_rect)
+                    color = self.COLORS.get(piece, CYAN)
+                    self.draw_piece_cell(cell_rect, color)
+
+    def rotate_piece(self, shape):
+        """Rotate a piece 90 degrees clockwise"""
+        # Create a new rotated shape without modifying the original
+        return [list(row) for row in zip(*shape[::-1])]
+
+    def is_valid_rotation(self, shape, board, pos):
+        """Check if a rotation is valid"""
+        rotated = self.rotate_piece(shape)
+        for y, row in enumerate(rotated):
+            for x, cell in enumerate(row):
+                if cell:
+                    board_x = pos[0] + x
+                    board_y = pos[1] + y
+                    if (board_x < 0 or board_x >= 10 or 
+                        board_y >= 20 or 
+                        (board_y >= 0 and board[board_y][board_x])):
+                        return False
+        return True
 
     def run(self):
         running = True
@@ -1172,38 +1369,46 @@ class MultiplayerGame:
             
             # Handle piece falling
             current_time = time.time()
-            if current_time - self.last_fall_time > self.fall_speed:
+            if current_time - self.last_fall_time > self.fall_speed and not self.game_over:
                 self.last_fall_time = current_time
                 
                 # Move pieces down
-                if self.player_role == 'player1':
+                if self.player_role == 'player1' and not self.p1_game_over:
                     if self.p1_current_piece:
                         new_pos = [self.p1_piece_pos[0], self.p1_piece_pos[1] + 1]
-                        if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
+                        if self.is_valid_move(self.p1_current_shape, self.p1_board, new_pos):
                             self.p1_piece_pos = new_pos
                         else:
-                            self.merge_piece(self.SHAPES[self.p1_current_piece], self.p1_board, self.p1_piece_pos)
+                            self.merge_piece(self.p1_current_shape, self.p1_board, self.p1_piece_pos, self.p1_current_piece)
                             lines = self.clear_lines(self.p1_board)
                             if lines > 0:
                                 self.p1_combo += 1
                                 self.score_p1 += lines * 100 * self.p1_combo
+                                # Immediately spawn new piece after clearing lines
+                                self.new_piece('p1')
+                                self.p1_current_shape = [row[:] for row in self.SHAPES[self.p1_current_piece]]
                             else:
                                 self.p1_combo = 0
-                            self.new_piece('p1')
-                else:
+                                self.new_piece('p1')
+                                self.p1_current_shape = [row[:] for row in self.SHAPES[self.p1_current_piece]]
+                elif self.player_role == 'player2' and not self.p2_game_over:
                     if self.p2_current_piece:
                         new_pos = [self.p2_piece_pos[0], self.p2_piece_pos[1] + 1]
-                        if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
+                        if self.is_valid_move(self.p2_current_shape, self.p2_board, new_pos):
                             self.p2_piece_pos = new_pos
                         else:
-                            self.merge_piece(self.SHAPES[self.p2_current_piece], self.p2_board, self.p2_piece_pos)
+                            self.merge_piece(self.p2_current_shape, self.p2_board, self.p2_piece_pos, self.p2_current_piece)
                             lines = self.clear_lines(self.p2_board)
                             if lines > 0:
                                 self.p2_combo += 1
                                 self.score_p2 += lines * 100 * self.p2_combo
+                                # Immediately spawn new piece after clearing lines
+                                self.new_piece('p2')
+                                self.p2_current_shape = [row[:] for row in self.SHAPES[self.p2_current_piece]]
                             else:
                                 self.p2_combo = 0
-                            self.new_piece('p2')
+                                self.new_piece('p2')
+                                self.p2_current_shape = [row[:] for row in self.SHAPES[self.p2_current_piece]]
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -1211,60 +1416,76 @@ class MultiplayerGame:
 
                 if not self.game_over and not self.paused:
                     if event.type == pygame.KEYDOWN:
-                        if self.player_role == 'player1':
+                        if self.player_role == 'player1' and not self.p1_game_over:
                             if event.key == pygame.K_LEFT:
                                 new_pos = [self.p1_piece_pos[0] - 1, self.p1_piece_pos[1]]
-                                if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
+                                if self.is_valid_move(self.p1_current_shape, self.p1_board, new_pos):
                                     self.p1_piece_pos = new_pos
                             elif event.key == pygame.K_RIGHT:
                                 new_pos = [self.p1_piece_pos[0] + 1, self.p1_piece_pos[1]]
-                                if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
+                                if self.is_valid_move(self.p1_current_shape, self.p1_board, new_pos):
                                     self.p1_piece_pos = new_pos
                             elif event.key == pygame.K_DOWN:
                                 new_pos = [self.p1_piece_pos[0], self.p1_piece_pos[1] + 1]
-                                if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
+                                if self.is_valid_move(self.p1_current_shape, self.p1_board, new_pos):
                                     self.p1_piece_pos = new_pos
+                            elif event.key == pygame.K_UP:
+                                # Rotate piece
+                                if self.is_valid_rotation(self.p1_current_shape, self.p1_board, self.p1_piece_pos):
+                                    self.p1_current_shape = self.rotate_piece(self.p1_current_shape)
                             elif event.key == pygame.K_SPACE:
                                 # Hard drop
-                                while self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, 
+                                while self.is_valid_move(self.p1_current_shape, self.p1_board, 
                                                        [self.p1_piece_pos[0], self.p1_piece_pos[1] + 1]):
                                     self.p1_piece_pos[1] += 1
-                                self.merge_piece(self.SHAPES[self.p1_current_piece], self.p1_board, self.p1_piece_pos)
+                                self.merge_piece(self.p1_current_shape, self.p1_board, self.p1_piece_pos, self.p1_current_piece)
                                 lines = self.clear_lines(self.p1_board)
                                 if lines > 0:
                                     self.p1_combo += 1
                                     self.score_p1 += lines * 100 * self.p1_combo
+                                    # Immediately spawn new piece after clearing lines
+                                    self.new_piece('p1')
+                                    self.p1_current_shape = [row[:] for row in self.SHAPES[self.p1_current_piece]]
                                 else:
                                     self.p1_combo = 0
-                                self.new_piece('p1')
+                                    self.new_piece('p1')
+                                    self.p1_current_shape = [row[:] for row in self.SHAPES[self.p1_current_piece]]
                             elif event.key == pygame.K_c:
                                 self.hold_piece('p1')
-                        else:  # player2
+                        elif self.player_role == 'player2' and not self.p2_game_over:
                             if event.key == pygame.K_LEFT:
                                 new_pos = [self.p2_piece_pos[0] - 1, self.p2_piece_pos[1]]
-                                if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
+                                if self.is_valid_move(self.p2_current_shape, self.p2_board, new_pos):
                                     self.p2_piece_pos = new_pos
                             elif event.key == pygame.K_RIGHT:
                                 new_pos = [self.p2_piece_pos[0] + 1, self.p2_piece_pos[1]]
-                                if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
+                                if self.is_valid_move(self.p2_current_shape, self.p2_board, new_pos):
                                     self.p2_piece_pos = new_pos
                             elif event.key == pygame.K_DOWN:
                                 new_pos = [self.p2_piece_pos[0], self.p2_piece_pos[1] + 1]
-                                if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
+                                if self.is_valid_move(self.p2_current_shape, self.p2_board, new_pos):
                                     self.p2_piece_pos = new_pos
+                            elif event.key == pygame.K_UP:
+                                # Rotate piece
+                                if self.is_valid_rotation(self.p2_current_shape, self.p2_board, self.p2_piece_pos):
+                                    self.p2_current_shape = self.rotate_piece(self.p2_current_shape)
                             elif event.key == pygame.K_SPACE:
                                 # Hard drop
-                                while self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, 
+                                while self.is_valid_move(self.p2_current_shape, self.p2_board, 
                                                        [self.p2_piece_pos[0], self.p2_piece_pos[1] + 1]):
                                     self.p2_piece_pos[1] += 1
-                                self.merge_piece(self.SHAPES[self.p2_current_piece], self.p2_board, self.p2_piece_pos)
+                                self.merge_piece(self.p2_current_shape, self.p2_board, self.p2_piece_pos, self.p2_current_piece)
                                 lines = self.clear_lines(self.p2_board)
                                 if lines > 0:
                                     self.p2_combo += 1
                                     self.score_p2 += lines * 100 * self.p2_combo
+                                    # Immediately spawn new piece after clearing lines
+                                    self.new_piece('p2')
+                                    self.p2_current_shape = [row[:] for row in self.SHAPES[self.p2_current_piece]]
                                 else:
                                     self.p2_combo = 0
-                                self.new_piece('p2')
+                                    self.new_piece('p2')
+                                    self.p2_current_shape = [row[:] for row in self.SHAPES[self.p2_current_piece]]
                             elif event.key == pygame.K_c:
                                 self.hold_piece('p2')
 
@@ -1280,7 +1501,9 @@ class MultiplayerGame:
                             self.show_help = not self.show_help
                         elif event.key == pygame.K_q:
                             running = False
-                elif self.game_over and event.type == pygame.MOUSEBUTTONDOWN:
+                elif ((self.player_role == 'player1' and self.p1_game_over and self.p2_game_over) or 
+                      (self.player_role == 'player2' and self.p2_game_over and self.p1_game_over)) and \
+                     event.type == pygame.MOUSEBUTTONDOWN:
                     if self.btn_main_menu.collidepoint(event.pos):
                         return "menu"
                     elif self.btn_exit_game.collidepoint(event.pos):
@@ -1288,7 +1511,8 @@ class MultiplayerGame:
 
             self.draw_video_background()
 
-            if self.game_over:
+            if (self.player_role == 'player1' and self.p1_game_over) or \
+               (self.player_role == 'player2' and self.p2_game_over):
                 self.draw_game_over()
             else:
                 self.draw_playfield()
