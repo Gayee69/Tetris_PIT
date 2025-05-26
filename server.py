@@ -114,7 +114,7 @@ class GameServer:
             username = self.clients[client]['username']
             
             if lobby_id in self.lobbies:
-                # Toggle ready status
+                # Toggle ready status for the specific player
                 self.lobbies[lobby_id]['ready'][username] = not self.lobbies[lobby_id]['ready'][username]
                 
                 # Check if all players are ready
@@ -126,6 +126,7 @@ class GameServer:
                         'ready': self.lobbies[lobby_id]['ready']
                     })
                 else:
+                    # Send ready update to all players
                     self.broadcast_to_lobby(lobby_id, {
                         'type': 'ready_update',
                         'players': self.lobbies[lobby_id]['players'],
