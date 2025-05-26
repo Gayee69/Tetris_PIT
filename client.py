@@ -489,7 +489,7 @@ class LobbyScreen:
                 elapsed = (current_time - countdown_start) / 1000  # Convert to seconds
                 if elapsed >= countdown_time:
                     # Start the game
-                    game = MultiplayerGame(screen, self.network, self.username, self.player_role)
+                    game = MultiplayerGame(screen, self.network, self.username, self.player_role, self.lobby_players)
                     result = game.run()
                     if result == "menu":
                         return
@@ -732,11 +732,12 @@ class LobbyScreen:
         cap.release()
 
 class MultiplayerGame:
-    def __init__(self, screen, network, username, player_role):
+    def __init__(self, screen, network, username, player_role, lobby_players):
         self.screen = screen
         self.network = network
         self.username = username
         self.player_role = player_role
+        self.lobby_players = lobby_players
         
         # Game state
         self.score_p1 = 0
@@ -745,25 +746,64 @@ class MultiplayerGame:
         self.show_help = False
         self.game_over = False
         
-        # Player names
-        self.player1_name = username if player_role == 'player1' else None
-        self.player2_name = username if player_role == 'player2' else None
+        # Initialize game boards and pieces
+        self.p1_board = [[0 for _ in range(10)] for _ in range(20)]
+        self.p2_board = [[0 for _ in range(10)] for _ in range(20)]
         
-        # Get opponent's name from lobby data
-        self.network.send({
-            'command': 'get_lobby_info',
-            'username': username
-        })
+        # Initialize piece states
+        self.p1_current_piece = None
+        self.p2_current_piece = None
+        self.p1_next_piece = None
+        self.p2_next_piece = None
+        self.p1_hold_piece = None
+        self.p2_hold_piece = None
+        self.p1_piece_pos = [0, 0]
+        self.p2_piece_pos = [0, 0]
+        
+        # Game timing
+        self.last_fall_time = time.time()
+        self.fall_speed = 1.0  # Time in seconds between piece falls
+        
+        # Combo tracking
+        self.p1_combo = 0
+        self.p2_combo = 0
+        
+        # Tetromino shapes
+        self.SHAPES = {
+            'I': [[1, 1, 1, 1]],
+            'O': [[1, 1], [1, 1]],
+            'T': [[0, 1, 0], [1, 1, 1]],
+            'S': [[0, 1, 1], [1, 1, 0]],
+            'Z': [[1, 1, 0], [0, 1, 1]],
+            'J': [[1, 0, 0], [1, 1, 1]],
+            'L': [[0, 0, 1], [1, 1, 1]]
+        }
+        
+        # Start with new pieces for both players
+        self.new_piece('p1')
+        self.new_piece('p2')
+        
+        # Start receiving thread for game updates
+        self.receive_thread = threading.Thread(target=self.receive_game_updates)
+        self.receive_thread.daemon = True
+        self.receive_thread.start()
         
         # Layout
         self.playfield_size = (300, 600)
         self.hold_box_size = (100, 100)
+        self.next_box_size = (100, 240)
         
-        # UI Elements
-        self.p1_hold = pygame.Rect(100, 150, *self.hold_box_size)
-        self.p1_playfield = pygame.Rect(self.p1_hold.right + 50, 100, *self.playfield_size)
-        self.p2_hold = pygame.Rect(WIDTH - 180, 150, *self.hold_box_size)
-        self.p2_playfield = pygame.Rect(self.p2_hold.left - 50 - self.playfield_size[0], 100, *self.playfield_size)
+        # UI Elements - Adjusted positions for better spacing
+        # Player 1 elements moved more to the left
+        self.p1_hold = pygame.Rect(50, 150, *self.hold_box_size)
+        self.p1_playfield = pygame.Rect(self.p1_hold.right + 30, 100, *self.playfield_size)
+        self.p1_next = pygame.Rect(self.p1_playfield.right + 30, 100, *self.next_box_size)
+        
+        # Player 2 elements adjusted to maintain symmetry
+        self.p2_hold = pygame.Rect(WIDTH - 150, 150, *self.hold_box_size)
+        self.p2_playfield = pygame.Rect(self.p2_hold.left - 30 - self.playfield_size[0], 100, *self.playfield_size)
+        self.p2_next = pygame.Rect(self.p2_playfield.left - 30 - self.next_box_size[0], 100, *self.next_box_size)
+        
         self.pause_button = pygame.Rect(WIDTH - 100, 20, 60, 40)
         self.menu_rect = pygame.Rect(WIDTH // 2 - 150, HEIGHT // 2 - 100, 300, 250)
         
@@ -777,75 +817,80 @@ class MultiplayerGame:
         self.bg_fps = 15
         self.bg_frame_surface = None
 
-        # Tetris game logic
-        self.BLOCK_SIZE = 30
-        self.BOARD_WIDTH = 10
-        self.BOARD_HEIGHT = 20
-        
-        # Colors for pieces
-        self.COLORS = {
-            'I': (0, 255, 255),    # Cyan
-            'O': (255, 255, 0),    # Yellow
-            'T': (128, 0, 128),    # Purple
-            'S': (0, 255, 0),      # Green
-            'Z': (255, 0, 0),      # Red
-            'J': (0, 0, 255),      # Blue
-            'L': (255, 127, 0)     # Orange
-        }
-        
-        # Tetromino shapes
-        self.SHAPES = {
-            'I': [[1, 1, 1, 1]],
-            'O': [[1, 1],
-                  [1, 1]],
-            'T': [[0, 1, 0],
-                  [1, 1, 1]],
-            'S': [[0, 1, 1],
-                  [1, 1, 0]],
-            'Z': [[1, 1, 0],
-                  [0, 1, 1]],
-            'J': [[1, 0, 0],
-                  [1, 1, 1]],
-            'L': [[0, 0, 1],
-                  [1, 1, 1]]
-        }
-        
-        # Initialize game boards for both players
-        self.p1_board = [[0 for _ in range(self.BOARD_WIDTH)] for _ in range(self.BOARD_HEIGHT)]
-        self.p2_board = [[0 for _ in range(self.BOARD_WIDTH)] for _ in range(self.BOARD_HEIGHT)]
-        
-        # Initialize current pieces and next pieces
-        self.p1_current_piece = None
-        self.p1_next_piece = None
-        self.p1_hold_piece = None
-        self.p1_can_hold = True
-        
-        self.p2_current_piece = None
-        self.p2_next_piece = None
-        self.p2_hold_piece = None
-        self.p2_can_hold = True
-        
-        # Initialize piece positions
-        self.p1_piece_pos = [0, 0]
-        self.p2_piece_pos = [0, 0]
-        
-        # Game timing
-        self.fall_time = 0
-        self.fall_speed = 0.5  # Time in seconds between automatic falls
-        self.last_fall_time = time.time()
-        
-        # Combo tracking
-        self.p1_combo = 0
-        self.p2_combo = 0
-        
-        # Start receiving thread for game updates
-        self.receive_thread = threading.Thread(target=self.receive_game_updates)
-        self.receive_thread.daemon = True
-        self.receive_thread.start()
-        
-        # Initialize first pieces
-        self.new_piece('p1')
-        self.new_piece('p2')
+    def new_piece(self, player):
+        """Generate a new piece for the specified player"""
+        shapes = list(self.SHAPES.keys())
+        if player == 'p1':
+            if not self.p1_next_piece:
+                self.p1_next_piece = random.choice(shapes)
+            self.p1_current_piece = self.p1_next_piece
+            self.p1_next_piece = random.choice(shapes)
+            self.p1_piece_pos = [3, 0]  # Start position
+        else:
+            if not self.p2_next_piece:
+                self.p2_next_piece = random.choice(shapes)
+            self.p2_current_piece = self.p2_next_piece
+            self.p2_next_piece = random.choice(shapes)
+            self.p2_piece_pos = [3, 0]  # Start position
+
+    def is_valid_move(self, shape, board, pos):
+        """Check if a move is valid"""
+        for y, row in enumerate(shape):
+            for x, cell in enumerate(row):
+                if cell:
+                    board_x = pos[0] + x
+                    board_y = pos[1] + y
+                    if (board_x < 0 or board_x >= 10 or 
+                        board_y >= 20 or 
+                        (board_y >= 0 and board[board_y][board_x])):
+                        return False
+        return True
+
+    def merge_piece(self, shape, board, pos):
+        """Merge the current piece into the board"""
+        for y, row in enumerate(shape):
+            for x, cell in enumerate(row):
+                if cell:
+                    board_y = pos[1] + y
+                    board_x = pos[0] + x
+                    if 0 <= board_y < 20 and 0 <= board_x < 10:
+                        board[board_y][board_x] = 1
+
+    def clear_lines(self, board):
+        """Clear completed lines and return number of lines cleared"""
+        lines_cleared = 0
+        y = 19
+        while y >= 0:
+            if all(board[y]):
+                lines_cleared += 1
+                # Move all lines above down
+                for y2 in range(y, 0, -1):
+                    board[y2] = board[y2-1][:]
+                board[0] = [0] * 10
+            else:
+                y -= 1
+        return lines_cleared
+
+    def hold_piece(self, player):
+        """Handle holding a piece"""
+        if player == 'p1':
+            if not self.p1_hold_piece:
+                self.p1_hold_piece = self.p1_current_piece
+                self.p1_current_piece = self.p1_next_piece
+                self.p1_next_piece = random.choice(list(self.SHAPES.keys()))
+                self.p1_piece_pos = [3, 0]
+            else:
+                self.p1_hold_piece, self.p1_current_piece = self.p1_current_piece, self.p1_hold_piece
+                self.p1_piece_pos = [3, 0]
+        else:
+            if not self.p2_hold_piece:
+                self.p2_hold_piece = self.p2_current_piece
+                self.p2_current_piece = self.p2_next_piece
+                self.p2_next_piece = random.choice(list(self.SHAPES.keys()))
+                self.p2_piece_pos = [3, 0]
+            else:
+                self.p2_hold_piece, self.p2_current_piece = self.p2_current_piece, self.p2_hold_piece
+                self.p2_piece_pos = [3, 0]
 
     def draw_text(self, text, pos, font, color=WHITE, center=False):
         render = font.render(text, True, color)
@@ -862,189 +907,92 @@ class MultiplayerGame:
         pygame.draw.rect(glow_surface, (*color, 80), glow_surface.get_rect(), border_radius=10)
         self.screen.blit(glow_surface, (rect.x - 10, rect.y - 10))
 
-    def new_piece(self, player):
-        """Generate a new piece for the specified player"""
-        if player == 'p1':
-            if not self.p1_next_piece:
-                self.p1_next_piece = random.choice(list(self.SHAPES.keys()))
-            self.p1_current_piece = self.p1_next_piece
-            self.p1_next_piece = random.choice(list(self.SHAPES.keys()))
-            self.p1_piece_pos = [self.BOARD_WIDTH // 2 - len(self.SHAPES[self.p1_current_piece][0]) // 2, 0]
-            self.p1_can_hold = True
-        else:
-            if not self.p2_next_piece:
-                self.p2_next_piece = random.choice(list(self.SHAPES.keys()))
-            self.p2_current_piece = self.p2_next_piece
-            self.p2_next_piece = random.choice(list(self.SHAPES.keys()))
-            self.p2_piece_pos = [self.BOARD_WIDTH // 2 - len(self.SHAPES[self.p2_current_piece][0]) // 2, 0]
-            self.p2_can_hold = True
-
-    def rotate_piece(self, piece, board, pos):
-        """Rotate a piece clockwise"""
-        # Create a new rotated piece
-        new_piece = list(zip(*piece[::-1]))
-        
-        # Check if rotation is valid
-        if self.is_valid_move(new_piece, board, pos):
-            return new_piece
-        return piece
-
-    def is_valid_move(self, piece, board, pos):
-        """Check if a move is valid"""
-        for y, row in enumerate(piece):
-            for x, cell in enumerate(row):
-                if cell:
-                    board_x = pos[0] + x
-                    board_y = pos[1] + y
-                    if (board_x < 0 or board_x >= self.BOARD_WIDTH or
-                        board_y >= self.BOARD_HEIGHT or
-                        (board_y >= 0 and board[board_y][board_x])):
-                        return False
-        return True
-
-    def merge_piece(self, piece, board, pos):
-        """Merge a piece into the board"""
-        for y, row in enumerate(piece):
-            for x, cell in enumerate(row):
-                if cell:
-                    board_y = pos[1] + y
-                    board_x = pos[0] + x
-                    if board_y >= 0:
-                        # Determine which player's board we're merging into
-                        if board is self.p1_board:
-                            board[board_y][board_x] = self.COLORS[self.p1_current_piece]
-                        else:
-                            board[board_y][board_x] = self.COLORS[self.p2_current_piece]
-
-    def clear_lines(self, board):
-        """Clear completed lines and return the number of lines cleared"""
-        lines_cleared = 0
-        y = self.BOARD_HEIGHT - 1
-        while y >= 0:
-            if all(board[y]):
-                lines_cleared += 1
-                # Move all lines above down
-                for y2 in range(y, 0, -1):
-                    board[y2] = board[y2-1][:]
-                board[0] = [0] * self.BOARD_WIDTH
-            else:
-                y -= 1
-        return lines_cleared
-
-    def hold_piece(self, player):
-        """Hold the current piece"""
-        if player == 'p1':
-            if self.p1_can_hold:
-                if self.p1_hold_piece:
-                    self.p1_current_piece, self.p1_hold_piece = self.p1_hold_piece, self.p1_current_piece
-                else:
-                    self.p1_hold_piece = self.p1_current_piece
-                    self.new_piece('p1')
-                self.p1_can_hold = False
-        else:
-            if self.p2_can_hold:
-                if self.p2_hold_piece:
-                    self.p2_current_piece, self.p2_hold_piece = self.p2_hold_piece, self.p2_current_piece
-                else:
-                    self.p2_hold_piece = self.p2_current_piece
-                    self.new_piece('p2')
-                self.p2_can_hold = False
-
-    def draw_piece(self, piece, pos, color, surface, offset=(0, 0)):
-        """Draw a piece on the surface"""
-        for y, row in enumerate(piece):
-            for x, cell in enumerate(row):
-                if cell:
-                    rect = pygame.Rect(
-                        offset[0] + (pos[0] + x) * self.BLOCK_SIZE,
-                        offset[1] + (pos[1] + y) * self.BLOCK_SIZE,
-                        self.BLOCK_SIZE - 1,
-                        self.BLOCK_SIZE - 1
-                    )
-                    pygame.draw.rect(surface, color, rect)
-                    pygame.draw.rect(surface, (255, 255, 255), rect, 1)
-
-    def draw_board(self, board, surface, offset=(0, 0)):
-        """Draw the game board"""
-        for y, row in enumerate(board):
-            for x, cell in enumerate(row):
-                if cell:
-                    rect = pygame.Rect(
-                        offset[0] + x * self.BLOCK_SIZE,
-                        offset[1] + y * self.BLOCK_SIZE,
-                        self.BLOCK_SIZE - 1,
-                        self.BLOCK_SIZE - 1
-                    )
-                    pygame.draw.rect(surface, cell, rect)
-                    pygame.draw.rect(surface, (255, 255, 255), rect, 1)
-
     def draw_playfield(self):
-        # Update player names if they're not set
-        if self.player_role == 'player1' and not self.player2_name:
-            self.player2_name = "Waiting for opponent..."
-        elif self.player_role == 'player2' and not self.player1_name:
-            self.player1_name = "Waiting for opponent..."
+        # Get player names - Player 1 is always first in lobby_players
+        p1_name = self.lobby_players[0]
+        p2_name = self.lobby_players[1]
 
-        self.draw_text(self.player1_name or "Waiting for opponent...", (self.p1_playfield.x, 50), get_font(36))
-        self.draw_text(self.player2_name or "Waiting for opponent...", (self.p2_playfield.x, 50), get_font(36))
+        self.draw_text(p1_name, (self.p1_playfield.x, 50), get_font(36))
+        self.draw_text(p2_name, (self.p2_playfield.x, 50), get_font(36))
 
         # Box sizes
-        next_box_size = (100, 240)
-        hold_box_size = (80, 80)
         score_box_size = (100, 50)
         combo_box_size = (100, 40)
         ui_spacing = 30
 
-        # Shift playfields toward center
-        self.p1_playfield.x = 200
-        self.p2_playfield.x = 800
-
         # P1 UI elements
-        p1_next_box = pygame.Rect(self.p1_playfield.right + ui_spacing, self.p1_playfield.y, *next_box_size)
-        p1_hold = pygame.Rect(self.p1_playfield.left - ui_spacing - hold_box_size[0], self.p1_playfield.y, *hold_box_size)
-        p1_score_box = pygame.Rect(70, p1_hold.bottom + 50, *score_box_size)
+        p1_score_box = pygame.Rect(70, self.p1_hold.bottom + 50, *score_box_size)
         p1_combo_box = pygame.Rect(p1_score_box.x, p1_score_box.bottom + 50, *combo_box_size)
 
         # P2 UI elements
-        p2_next_box = pygame.Rect(self.p2_playfield.left - ui_spacing - next_box_size[0], self.p2_playfield.y, *next_box_size)
-        p2_hold = pygame.Rect(self.p2_playfield.right + ui_spacing, self.p2_playfield.y, *hold_box_size)
-        p2_score_box = pygame.Rect(p2_hold.x, p2_hold.bottom + 50, *score_box_size)
+        p2_score_box = pygame.Rect(self.p2_hold.x, self.p2_hold.bottom + 50, *score_box_size)
         p2_combo_box = pygame.Rect(p2_score_box.x, p2_score_box.bottom + 50, *combo_box_size)
 
         # Draw Playfields
-        for rect in [self.p1_playfield, self.p2_playfield]:
+        for rect, board, current_piece, piece_pos in [
+            (self.p1_playfield, self.p1_board, self.p1_current_piece, self.p1_piece_pos),
+            (self.p2_playfield, self.p2_board, self.p2_current_piece, self.p2_piece_pos)
+        ]:
+            # Draw grid
+            cell_size = rect.width // 10
+            for y in range(20):
+                for x in range(10):
+                    cell_rect = pygame.Rect(
+                        rect.x + x * cell_size,
+                        rect.y + y * cell_size,
+                        cell_size - 1,
+                        cell_size - 1
+                    )
+                    if board[y][x]:
+                        pygame.draw.rect(self.screen, CYAN, cell_rect)
+                    else:
+                        pygame.draw.rect(self.screen, (30, 30, 30), cell_rect)
+            
+            # Draw current piece
+            if current_piece:
+                shape = self.SHAPES[current_piece]
+                for y, row in enumerate(shape):
+                    for x, cell in enumerate(row):
+                        if cell:
+                            cell_rect = pygame.Rect(
+                                rect.x + (piece_pos[0] + x) * cell_size,
+                                rect.y + (piece_pos[1] + y) * cell_size,
+                                cell_size - 1,
+                                cell_size - 1
+                            )
+                            pygame.draw.rect(self.screen, CYAN, cell_rect)
+            
             overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 120))
             self.screen.blit(overlay, rect)
             self.draw_glow_rect(rect, CYAN)
 
-        # Draw boards
-        self.draw_board(self.p1_board, self.screen, (self.p1_playfield.x, self.p1_playfield.y))
-        self.draw_board(self.p2_board, self.screen, (self.p2_playfield.x, self.p2_playfield.y))
+        # Draw Hold Boxes
+        for rect, hold_piece in [(self.p1_hold, self.p1_hold_piece), (self.p2_hold, self.p2_hold_piece)]:
+            overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 120))
+            self.screen.blit(overlay, rect)
+            self.draw_glow_rect(rect, CYAN)
+            self.draw_text("Hold", (rect.x, rect.y - 25), get_font(24))
+            if hold_piece:
+                self.draw_piece(hold_piece, rect, 0.8)
 
-        # Draw current pieces
-        if self.p1_current_piece:
-            self.draw_piece(
-                self.SHAPES[self.p1_current_piece],
-                self.p1_piece_pos,
-                self.COLORS[self.p1_current_piece],
-                self.screen,
-                (self.p1_playfield.x, self.p1_playfield.y)
-            )
-        if self.p2_current_piece:
-            self.draw_piece(
-                self.SHAPES[self.p2_current_piece],
-                self.p2_piece_pos,
-                self.COLORS[self.p2_current_piece],
-                self.screen,
-                (self.p2_playfield.x, self.p2_playfield.y)
-            )
+        # Draw Next Boxes
+        for rect, next_piece in [(self.p1_next, self.p1_next_piece), (self.p2_next, self.p2_next_piece)]:
+            overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 120))
+            self.screen.blit(overlay, rect)
+            self.draw_glow_rect(rect, CYAN)
+            self.draw_text("Next", (rect.x, rect.y - 25), get_font(24))
+            if next_piece:
+                self.draw_piece(next_piece, rect, 0.8)
 
-        # Draw UI Boxes
+        # Draw Score and Combo Boxes
         for box, label, value in [
-            (p1_hold, "Hold", None), (p2_hold, "Hold", None),
-            (p1_score_box, "Score:", self.score_p1), (p2_score_box, "Score:", self.score_p2),
-            (p1_combo_box, "Combo:", self.p1_combo), (p2_combo_box, "Combo:", self.p2_combo),
+            (p1_score_box, "Score:", self.score_p1),
+            (p2_score_box, "Score:", self.score_p2),
+            (p1_combo_box, "Combo:", self.p1_combo),
+            (p2_combo_box, "Combo:", self.p2_combo)
         ]:
             self.draw_text(label, (box.x, box.y - 25), get_font(24))
             overlay = pygame.Surface(box.size, pygame.SRCALPHA)
@@ -1053,50 +1001,6 @@ class MultiplayerGame:
             self.draw_glow_rect(box, CYAN)
             if value is not None:
                 self.draw_text(str(value), box.center, get_font(24), center=True)
-
-        # Draw Next Boxes
-        for rect, label in [(p1_next_box, "Next"), (p2_next_box, "Next")]:
-            overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
-            overlay.fill((0, 0, 0, 120))
-            self.screen.blit(overlay, rect)
-            self.draw_glow_rect(rect, CYAN)
-            self.draw_text(label, (rect.x, rect.y - 25), get_font(24))
-
-        # Draw hold pieces
-        if self.p1_hold_piece:
-            self.draw_piece(
-                self.SHAPES[self.p1_hold_piece],
-                [1, 1],
-                self.COLORS[self.p1_hold_piece],
-                self.screen,
-                (p1_hold.x, p1_hold.y)
-            )
-        if self.p2_hold_piece:
-            self.draw_piece(
-                self.SHAPES[self.p2_hold_piece],
-                [1, 1],
-                self.COLORS[self.p2_hold_piece],
-                self.screen,
-                (p2_hold.x, p2_hold.y)
-            )
-
-        # Draw next pieces
-        if self.p1_next_piece:
-            self.draw_piece(
-                self.SHAPES[self.p1_next_piece],
-                [1, 1],
-                self.COLORS[self.p1_next_piece],
-                self.screen,
-                (p1_next_box.x, p1_next_box.y)
-            )
-        if self.p2_next_piece:
-            self.draw_piece(
-                self.SHAPES[self.p2_next_piece],
-                [1, 1],
-                self.COLORS[self.p2_next_piece],
-                self.screen,
-                (p2_next_box.x, p2_next_box.y)
-            )
 
         pygame.draw.rect(self.screen, CYAN, self.pause_button, 2)
         self.draw_text("Menu", self.pause_button.center, get_font(24), center=True)
@@ -1140,13 +1044,11 @@ class MultiplayerGame:
         overlay.fill((0, 0, 0, 200))
         self.screen.blit(overlay, (0, 0))
 
-        if self.score_p1 > self.score_p2:
-            winner = f"{self.player1_name} Wins!"
-        elif self.score_p2 > self.score_p1:
-            winner = f"{self.player2_name} Wins!"
-        else:
-            winner = "It's a Tie!"
+        # Get player names - Player 1 is always first in lobby_players
+        p1_name = self.lobby_players[0]
+        p2_name = self.lobby_players[1]
 
+        winner = f"{p1_name} Wins!" if self.score_p1 > self.score_p2 else f"{p2_name} Wins!" if self.score_p2 > self.score_p1 else "It's a Tie!"
         self.draw_text("Game Over", (WIDTH // 2, 80), get_font(36), center=True)
         self.draw_text(winner, (WIDTH // 2, 130), get_font(36), center=True)
 
@@ -1157,146 +1059,6 @@ class MultiplayerGame:
         pygame.draw.rect(self.screen, (30, 30, 30), self.btn_exit_game)
         pygame.draw.rect(self.screen, CYAN, self.btn_exit_game, 2)
         self.draw_text("Exit Game", self.btn_exit_game.center, get_font(24), center=True)
-
-    def run(self):
-        running = True
-        while running:
-            clock.tick(60)  # Increased FPS for smoother gameplay
-            
-            # Handle piece falling
-            current_time = time.time()
-            if current_time - self.last_fall_time > self.fall_speed:
-                self.last_fall_time = current_time
-                
-                # Move pieces down
-                if self.player_role == 'player1':
-                    if self.p1_current_piece:
-                        new_pos = [self.p1_piece_pos[0], self.p1_piece_pos[1] + 1]
-                        if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
-                            self.p1_piece_pos = new_pos
-                        else:
-                            self.merge_piece(self.SHAPES[self.p1_current_piece], self.p1_board, self.p1_piece_pos)
-                            lines = self.clear_lines(self.p1_board)
-                            if lines > 0:
-                                self.p1_combo += 1
-                                self.score_p1 += lines * 100 * self.p1_combo
-                                self.network.send({
-                                    'command': 'game_update',
-                                    'type': 'score_update',
-                                    'player': 'p1',
-                                    'score': self.score_p1,
-                                    'combo': self.p1_combo
-                                })
-                            else:
-                                self.p1_combo = 0
-                            self.new_piece('p1')
-                else:
-                    if self.p2_current_piece:
-                        new_pos = [self.p2_piece_pos[0], self.p2_piece_pos[1] + 1]
-                        if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
-                            self.p2_piece_pos = new_pos
-                        else:
-                            self.merge_piece(self.SHAPES[self.p2_current_piece], self.p2_board, self.p2_piece_pos)
-                            lines = self.clear_lines(self.p2_board)
-                            if lines > 0:
-                                self.p2_combo += 1
-                                self.score_p2 += lines * 100 * self.p2_combo
-                                self.network.send({
-                                    'command': 'game_update',
-                                    'type': 'score_update',
-                                    'player': 'p2',
-                                    'score': self.score_p2,
-                                    'combo': self.p2_combo
-                                })
-                            else:
-                                self.p2_combo = 0
-                            self.new_piece('p2')
-
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-
-                if not self.game_over:
-                    if event.type == pygame.MOUSEBUTTONDOWN and self.pause_button.collidepoint(event.pos):
-                        self.paused = not self.paused
-                    elif event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_ESCAPE:
-                            self.paused = not self.paused
-                        elif self.paused:
-                            if event.key == pygame.K_r:
-                                self.paused = False
-                            elif event.key == pygame.K_h:
-                                self.show_help = not self.show_help
-                            elif event.key == pygame.K_q:
-                                running = False
-                        else:
-                            # Handle game controls
-                            if self.player_role == 'player1':
-                                if event.key == pygame.K_LEFT:
-                                    new_pos = [self.p1_piece_pos[0] - 1, self.p1_piece_pos[1]]
-                                    if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
-                                        self.p1_piece_pos = new_pos
-                                elif event.key == pygame.K_RIGHT:
-                                    new_pos = [self.p1_piece_pos[0] + 1, self.p1_piece_pos[1]]
-                                    if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
-                                        self.p1_piece_pos = new_pos
-                                elif event.key == pygame.K_DOWN:
-                                    new_pos = [self.p1_piece_pos[0], self.p1_piece_pos[1] + 1]
-                                    if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
-                                        self.p1_piece_pos = new_pos
-                                elif event.key == pygame.K_UP:
-                                    rotated = self.rotate_piece(self.SHAPES[self.p1_current_piece], self.p1_board, self.p1_piece_pos)
-                                    if rotated != self.SHAPES[self.p1_current_piece]:
-                                        self.SHAPES[self.p1_current_piece] = rotated
-                                elif event.key == pygame.K_SPACE:
-                                    # Hard drop
-                                    while self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, [self.p1_piece_pos[0], self.p1_piece_pos[1] + 1]):
-                                        self.p1_piece_pos[1] += 1
-                                elif event.key == pygame.K_c:
-                                    self.hold_piece('p1')
-                            else:
-                                if event.key == pygame.K_LEFT:
-                                    new_pos = [self.p2_piece_pos[0] - 1, self.p2_piece_pos[1]]
-                                    if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
-                                        self.p2_piece_pos = new_pos
-                                elif event.key == pygame.K_RIGHT:
-                                    new_pos = [self.p2_piece_pos[0] + 1, self.p2_piece_pos[1]]
-                                    if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
-                                        self.p2_piece_pos = new_pos
-                                elif event.key == pygame.K_DOWN:
-                                    new_pos = [self.p2_piece_pos[0], self.p2_piece_pos[1] + 1]
-                                    if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
-                                        self.p2_piece_pos = new_pos
-                                elif event.key == pygame.K_UP:
-                                    rotated = self.rotate_piece(self.SHAPES[self.p2_current_piece], self.p2_board, self.p2_piece_pos)
-                                    if rotated != self.SHAPES[self.p2_current_piece]:
-                                        self.SHAPES[self.p2_current_piece] = rotated
-                                elif event.key == pygame.K_SPACE:
-                                    # Hard drop
-                                    while self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, [self.p2_piece_pos[0], self.p2_piece_pos[1] + 1]):
-                                        self.p2_piece_pos[1] += 1
-                                elif event.key == pygame.K_c:
-                                    self.hold_piece('p2')
-                else:
-                    if event.type == pygame.MOUSEBUTTONDOWN:
-                        if self.btn_main_menu.collidepoint(event.pos):
-                            return "menu"
-                        elif self.btn_exit_game.collidepoint(event.pos):
-                            running = False
-
-            self.draw_video_background()
-
-            if self.game_over:
-                self.draw_game_over()
-            else:
-                self.draw_playfield()
-                if self.paused:
-                    self.draw_menu()
-
-            pygame.display.flip()
-
-        self.cap.release()
-        return "exit"
 
     def receive_game_updates(self):
         while True:
@@ -1320,10 +1082,223 @@ class MultiplayerGame:
                                 else:
                                     self.player2_name = player
                     elif message.get('type') == 'game_update':
-                        # Handle other game updates here
-                        pass
+                        # Update opponent's game state
+                        if message.get('sender') != self.username:
+                            if self.player_role == 'player1':
+                                self.p2_board = message.get('board', self.p2_board)
+                                self.score_p2 = message.get('score', self.score_p2)
+                                self.p2_combo = message.get('combo', self.p2_combo)
+                                self.p2_current_piece = message.get('current_piece', self.p2_current_piece)
+                                self.p2_next_piece = message.get('next_piece', self.p2_next_piece)
+                                self.p2_hold_piece = message.get('hold_piece', self.p2_hold_piece)
+                                self.p2_piece_pos = message.get('piece_pos', self.p2_piece_pos)
+                            else:
+                                self.p1_board = message.get('board', self.p1_board)
+                                self.score_p1 = message.get('score', self.score_p1)
+                                self.p1_combo = message.get('combo', self.p1_combo)
+                                self.p1_current_piece = message.get('current_piece', self.p1_current_piece)
+                                self.p1_next_piece = message.get('next_piece', self.p1_next_piece)
+                                self.p1_hold_piece = message.get('hold_piece', self.p1_hold_piece)
+                                self.p1_piece_pos = message.get('piece_pos', self.p1_piece_pos)
             except:
                 break
+
+    def send_game_update(self):
+        """Send current game state to the server"""
+        if self.player_role == 'player1':
+            game_state = {
+                'command': 'game_update',
+                'board': self.p1_board,
+                'score': self.score_p1,
+                'combo': self.p1_combo,
+                'current_piece': self.p1_current_piece,
+                'next_piece': self.p1_next_piece,
+                'hold_piece': self.p1_hold_piece,
+                'piece_pos': self.p1_piece_pos
+            }
+        else:
+            game_state = {
+                'command': 'game_update',
+                'board': self.p2_board,
+                'score': self.score_p2,
+                'combo': self.p2_combo,
+                'current_piece': self.p2_current_piece,
+                'next_piece': self.p2_next_piece,
+                'hold_piece': self.p2_hold_piece,
+                'piece_pos': self.p2_piece_pos
+            }
+        self.network.send(game_state)
+
+    def draw_piece(self, piece, rect, scale=1.0):
+        """Draw a tetromino piece in the specified rectangle"""
+        if not piece:
+            return
+            
+        shape = self.SHAPES[piece]
+        cell_size = min(rect.width // 4, rect.height // 4) * scale
+        
+        # Calculate center position
+        center_x = rect.x + rect.width // 2
+        center_y = rect.y + rect.height // 2
+        
+        # Calculate offset to center the piece
+        offset_x = center_x - (len(shape[0]) * cell_size) // 2
+        offset_y = center_y - (len(shape) * cell_size) // 2
+        
+        for y, row in enumerate(shape):
+            for x, cell in enumerate(row):
+                if cell:
+                    cell_rect = pygame.Rect(
+                        offset_x + x * cell_size,
+                        offset_y + y * cell_size,
+                        cell_size - 1,
+                        cell_size - 1
+                    )
+                    pygame.draw.rect(self.screen, CYAN, cell_rect)
+
+    def run(self):
+        running = True
+        last_update_time = time.time()
+        update_interval = 0.1  # Send updates every 100ms
+
+        while running:
+            clock.tick(60)  # Increased FPS for smoother gameplay
+            
+            # Send periodic game updates
+            current_time = time.time()
+            if current_time - last_update_time >= update_interval:
+                self.send_game_update()
+                last_update_time = current_time
+            
+            # Handle piece falling
+            current_time = time.time()
+            if current_time - self.last_fall_time > self.fall_speed:
+                self.last_fall_time = current_time
+                
+                # Move pieces down
+                if self.player_role == 'player1':
+                    if self.p1_current_piece:
+                        new_pos = [self.p1_piece_pos[0], self.p1_piece_pos[1] + 1]
+                        if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
+                            self.p1_piece_pos = new_pos
+                        else:
+                            self.merge_piece(self.SHAPES[self.p1_current_piece], self.p1_board, self.p1_piece_pos)
+                            lines = self.clear_lines(self.p1_board)
+                            if lines > 0:
+                                self.p1_combo += 1
+                                self.score_p1 += lines * 100 * self.p1_combo
+                            else:
+                                self.p1_combo = 0
+                            self.new_piece('p1')
+                else:
+                    if self.p2_current_piece:
+                        new_pos = [self.p2_piece_pos[0], self.p2_piece_pos[1] + 1]
+                        if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
+                            self.p2_piece_pos = new_pos
+                        else:
+                            self.merge_piece(self.SHAPES[self.p2_current_piece], self.p2_board, self.p2_piece_pos)
+                            lines = self.clear_lines(self.p2_board)
+                            if lines > 0:
+                                self.p2_combo += 1
+                                self.score_p2 += lines * 100 * self.p2_combo
+                            else:
+                                self.p2_combo = 0
+                            self.new_piece('p2')
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+
+                if not self.game_over and not self.paused:
+                    if event.type == pygame.KEYDOWN:
+                        if self.player_role == 'player1':
+                            if event.key == pygame.K_LEFT:
+                                new_pos = [self.p1_piece_pos[0] - 1, self.p1_piece_pos[1]]
+                                if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
+                                    self.p1_piece_pos = new_pos
+                            elif event.key == pygame.K_RIGHT:
+                                new_pos = [self.p1_piece_pos[0] + 1, self.p1_piece_pos[1]]
+                                if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
+                                    self.p1_piece_pos = new_pos
+                            elif event.key == pygame.K_DOWN:
+                                new_pos = [self.p1_piece_pos[0], self.p1_piece_pos[1] + 1]
+                                if self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, new_pos):
+                                    self.p1_piece_pos = new_pos
+                            elif event.key == pygame.K_SPACE:
+                                # Hard drop
+                                while self.is_valid_move(self.SHAPES[self.p1_current_piece], self.p1_board, 
+                                                       [self.p1_piece_pos[0], self.p1_piece_pos[1] + 1]):
+                                    self.p1_piece_pos[1] += 1
+                                self.merge_piece(self.SHAPES[self.p1_current_piece], self.p1_board, self.p1_piece_pos)
+                                lines = self.clear_lines(self.p1_board)
+                                if lines > 0:
+                                    self.p1_combo += 1
+                                    self.score_p1 += lines * 100 * self.p1_combo
+                                else:
+                                    self.p1_combo = 0
+                                self.new_piece('p1')
+                            elif event.key == pygame.K_c:
+                                self.hold_piece('p1')
+                        else:  # player2
+                            if event.key == pygame.K_LEFT:
+                                new_pos = [self.p2_piece_pos[0] - 1, self.p2_piece_pos[1]]
+                                if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
+                                    self.p2_piece_pos = new_pos
+                            elif event.key == pygame.K_RIGHT:
+                                new_pos = [self.p2_piece_pos[0] + 1, self.p2_piece_pos[1]]
+                                if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
+                                    self.p2_piece_pos = new_pos
+                            elif event.key == pygame.K_DOWN:
+                                new_pos = [self.p2_piece_pos[0], self.p2_piece_pos[1] + 1]
+                                if self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, new_pos):
+                                    self.p2_piece_pos = new_pos
+                            elif event.key == pygame.K_SPACE:
+                                # Hard drop
+                                while self.is_valid_move(self.SHAPES[self.p2_current_piece], self.p2_board, 
+                                                       [self.p2_piece_pos[0], self.p2_piece_pos[1] + 1]):
+                                    self.p2_piece_pos[1] += 1
+                                self.merge_piece(self.SHAPES[self.p2_current_piece], self.p2_board, self.p2_piece_pos)
+                                lines = self.clear_lines(self.p2_board)
+                                if lines > 0:
+                                    self.p2_combo += 1
+                                    self.score_p2 += lines * 100 * self.p2_combo
+                                else:
+                                    self.p2_combo = 0
+                                self.new_piece('p2')
+                            elif event.key == pygame.K_c:
+                                self.hold_piece('p2')
+
+                if event.type == pygame.MOUSEBUTTONDOWN and self.pause_button.collidepoint(event.pos):
+                    self.paused = not self.paused
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self.paused = not self.paused
+                    elif self.paused:
+                        if event.key == pygame.K_r:
+                            self.paused = False
+                        elif event.key == pygame.K_h:
+                            self.show_help = not self.show_help
+                        elif event.key == pygame.K_q:
+                            running = False
+                elif self.game_over and event.type == pygame.MOUSEBUTTONDOWN:
+                    if self.btn_main_menu.collidepoint(event.pos):
+                        return "menu"
+                    elif self.btn_exit_game.collidepoint(event.pos):
+                        running = False
+
+            self.draw_video_background()
+
+            if self.game_over:
+                self.draw_game_over()
+            else:
+                self.draw_playfield()
+                if self.paused:
+                    self.draw_menu()
+
+            pygame.display.flip()
+
+        self.cap.release()
+        return "exit"
 
 def main():
     # Play loading video and wait for key press
