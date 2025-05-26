@@ -43,8 +43,6 @@ class GameServer:
                     self.send_lobby_list(client)
                 elif command == 'chat':
                     self.handle_chat(client, message)
-                elif command == 'get_lobby_info':
-                    self.handle_get_lobby_info(client, message)
                 elif command == 'game_update':
                     self.handle_game_update(client, message)
                     
@@ -199,56 +197,37 @@ class GameServer:
                     'message': chat_message
                 })
 
-    def handle_get_lobby_info(self, client, message):
-        if client in self.clients:
-            lobby_id = self.clients[client]['lobby']
-            if lobby_id in self.lobbies:
-                response = {
-                    'type': 'lobby_info',
-                    'players': self.lobbies[lobby_id]['players'],
-                    'roles': self.lobbies[lobby_id]['roles'],
-                    'ready': self.lobbies[lobby_id]['ready']
-                }
-                client.send(json.dumps(response).encode('utf-8'))
-
     def handle_game_update(self, client, message):
         if client not in self.clients:
             return
-        
-        lobby = None
-        for l in self.lobbies.values():
-            if client in l['players']:
-                lobby = l
-                break
             
-        if not lobby:
+        lobby_id = self.clients[client]['lobby']
+        if lobby_id not in self.lobbies:
             return
-        
-        # Get opponent
-        opponent = None
-        for player in lobby['players']:
-            if player != client:
-                opponent = player
-                break
             
-        if not opponent:
-            return
+        # Get the sender's username
+        sender = self.clients[client]['username']
         
-        # Send game update to opponent
-        response = {
+        # Create update message for other player
+        update_message = {
             'type': 'game_update',
-            'opponent_grid': message.get('grid'),
-            'opponent_score': message.get('score'),
-            'opponent_combo': message.get('combo'),
-            'garbage_lines': message.get('garbage_lines')
+            'sender': sender,
+            'board': message.get('board'),
+            'score': message.get('score'),
+            'combo': message.get('combo'),
+            'current_piece': message.get('current_piece'),
+            'next_piece': message.get('next_piece'),
+            'hold_piece': message.get('hold_piece'),
+            'piece_pos': message.get('piece_pos')
         }
         
-        # Check for game over
-        if message.get('game_over'):
-            response['game_over'] = True
-            response['winner'] = message.get('winner')
-        
-        self.broadcast_to_lobby(lobby['lobby_id'], response)
+        # Broadcast to other player in the lobby
+        for other_client, client_data in self.clients.items():
+            if client_data['lobby'] == lobby_id and client_data['username'] != sender:
+                try:
+                    other_client.send(json.dumps(update_message).encode('utf-8'))
+                except:
+                    pass
 
 if __name__ == "__main__":
     server = GameServer()
